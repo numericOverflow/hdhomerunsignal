@@ -129,6 +129,7 @@ Perfect for aligning your antenna for optimal signal reception:
 | `PORT` | Web server port | `3000` |
 | `HDHOMERUN_DEVICES` | Comma-separated list of device IPs or hostnames to manually add (supplements auto-discovery) | *(empty)* |
 | `HDHOMERUN_DISABLE_DISCOVERY` | Set to `true` to disable auto-discovery (use only manually specified devices) | `false` |
+| `TEST_TUNE_IDLE_MINUTES` | Minutes after the last pick, next, or previous before the app frees a tuner that it tuned. `0` turns the idle timeout off. The app also frees its tuners when you leave Antenna Mode, 2 minutes after the browser disconnects, and when the container stops. | `15` |
 
 **Examples:**
 
