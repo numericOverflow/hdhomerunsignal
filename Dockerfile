@@ -1,5 +1,5 @@
 # Multi-stage build for React frontend and Node.js backend
-FROM node:18-alpine as frontend-build
+FROM node:18-alpine AS frontend-build
 
 WORKDIR /app/frontend
 COPY frontend/package.json ./
