@@ -145,6 +145,9 @@ function AntennaMode({ allTunersData, deviceId }) {
         });
       }
 
+      // Wait for lock before spending fetch attempts
+      if (!status.lock) return;
+
       const state = programFetchRef.current[tuner];
       if (state.done || state.inFlight || state.attempts >= PROGRAM_FETCH_MAX_ATTEMPTS || Date.now() < state.nextAt) {
         return;
