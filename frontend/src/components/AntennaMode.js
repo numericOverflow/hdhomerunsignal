@@ -235,11 +235,14 @@ function AntennaMode({ allTunersData, deviceId }) {
 
   const formatProgram = (program) => `${program.virtualChannel} ${program.callsign}`;
 
-  // Compact line: one program chip plus "+N more" with the full list in a tooltip
-  const renderPrograms = (programs) => {
+  // Compact line: one program chip plus "+N more" with the full list in a tooltip.
+  // The active program (the one a client is watching) is shown first as a filled chip.
+  const renderPrograms = (programs, currentProgram) => {
     if (!programs || programs.length === 0) return null;
 
-    const primary = programs[0];
+    const isActive = (program) => currentProgram != null && String(program.programNum) === String(currentProgram);
+    const active = programs.find(isActive);
+    const primary = active || programs[0];
     const others = programs.length - 1;
 
     return (
@@ -248,7 +251,8 @@ function AntennaMode({ allTunersData, deviceId }) {
           label={formatProgram(primary)}
           size="small"
           color="primary"
-          variant="outlined"
+          variant={active ? 'filled' : 'outlined'}
+          title={active ? 'Program a client is watching on this tuner' : undefined}
           sx={{ height: 20, fontSize: '0.7rem' }}
         />
         {others > 0 && (
@@ -258,8 +262,13 @@ function AntennaMode({ allTunersData, deviceId }) {
             title={
               <Box>
                 {programs.map(program => (
-                  <Typography key={program.programNum} variant="caption" component="div">
-                    {formatProgram(program)}
+                  <Typography
+                    key={program.programNum}
+                    variant="caption"
+                    component="div"
+                    sx={{ fontWeight: isActive(program) ? 700 : 400 }}
+                  >
+                    {formatProgram(program)}{isActive(program) ? ' (watching)' : ''}
                   </Typography>
                 ))}
               </Box>
@@ -346,7 +355,7 @@ function AntennaMode({ allTunersData, deviceId }) {
       </Typography>
 
       <Grid container spacing={2}>
-        {allTunersData.map(({ tuner, status }) => (
+        {allTunersData.map(({ tuner, status, currentProgram }) => (
           <Grid item xs={12} md={6} key={tuner}>
             <Card>
               <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
@@ -367,7 +376,7 @@ function AntennaMode({ allTunersData, deviceId }) {
                     <Typography variant="body2" sx={{ fontSize: '0.8rem', color: 'text.secondary' }}>
                       {formatChannelDisplay(status.channel)}
                     </Typography>
-                    {renderPrograms(programsByTuner[tuner])}
+                    {renderPrograms(programsByTuner[tuner], currentProgram)}
                   </Box>
                 )}
 
