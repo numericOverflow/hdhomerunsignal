@@ -72,6 +72,8 @@ import {
 import axios from 'axios';
 import io from 'socket.io-client';
 import AntennaMode from './AntennaMode';
+import StationPicker, { tunerStateText } from './StationPicker';
+import { getClientId } from '../clientId';
 
 // Register Chart.js components
 ChartJS.register(
@@ -362,6 +364,7 @@ function SignalMeter() {
   });
   const [selectedChannel, setSelectedChannel] = useState('');
   const [tunerStatus, setTunerStatus] = useState(null);
+  const [tuneError, setTuneError] = useState('');
   const [loading, setLoading] = useState(false);
   const [socket, setSocket] = useState(null);
   const [directChannel, setDirectChannel] = useState('');
@@ -451,6 +454,7 @@ function SignalMeter() {
   useEffect(() => {
     discoverDevices();
     const newSocket = io({
+      auth: { clientId: getClientId() },
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
@@ -736,8 +740,11 @@ function SignalMeter() {
       setIsAtsc3Channel(false);
 
       // Use regular tuning - let backend auto-detect ATSC 3.0
+      setTuneError('');
       await axios.post(`/api/devices/${selectedDevice}/tuner/${selectedTuner}/channel`, {
-        channel
+        channel,
+        clientId: getClientId(),
+        source: 'single'
       });
 
       setSelectedChannel(channel);
@@ -772,6 +779,7 @@ function SignalMeter() {
       waitAndGetPrograms();
     } catch (error) {
       console.error('Failed to set channel:', error);
+      setTuneError(error.response?.data?.error || 'Tune failed');
     }
   };
 
@@ -871,9 +879,13 @@ function SignalMeter() {
       setL1Info(null);
       setIsAtsc3Channel(false);
 
-      await axios.post(`/api/devices/${selectedDevice}/tuner/${selectedTuner}/clear`);
+      setTuneError('');
+      await axios.post(`/api/devices/${selectedDevice}/tuner/${selectedTuner}/clear`, {
+        clientId: getClientId()
+      });
     } catch (error) {
       console.error('Failed to clear tuner:', error);
+      setTuneError(error.response?.data?.error || 'Stop failed');
     }
   };
 
@@ -1129,6 +1141,33 @@ function SignalMeter() {
                   </Box>
                 </Box>
 
+                {/* Tune by station (virtual channel or name), only on a tuner this browser may change */}
+                {(() => {
+                  const tunerState = tunerStatus?.tunerStates?.[selectedTuner];
+                  return (
+                    <Box sx={{ mb: 1 }}>
+                      <StationPicker
+                        deviceId={selectedDevice}
+                        tuner={selectedTuner}
+                        tunerState={tunerState}
+                        source="single"
+                        onTuned={() => setTuneError('')}
+                      />
+                      {tunerState && (
+                        <Typography variant="caption" sx={{ display: 'block', mt: 0.5, color: tunerState.state === 'in-use' ? 'warning.main' : 'text.secondary' }}>
+                          Tuner {selectedTuner}: {tunerStateText(tunerState)}
+                          {tunerState.state === 'in-use' && '. Pick a free tuner below to test.'}
+                        </Typography>
+                      )}
+                      {tuneError && (
+                        <Typography variant="caption" color="error" sx={{ display: 'block', mt: 0.5 }}>
+                          {tuneError}
+                        </Typography>
+                      )}
+                    </Box>
+                  );
+                })()}
+
                 {/* Compact Signal Display */}
                 {/* Show meters while tuned, also without lock, for antenna aiming */}
                 {tunerStatus?.channel && tunerStatus.channel !== 'none' ? (() => {
@@ -1204,10 +1243,14 @@ function SignalMeter() {
                         value={selectedTuner}
                         label="Tuner"
                         onChange={(e) => setSelectedTuner(e.target.value)}
+                        renderValue={(value) => `Tuner ${value}`}
                       >
-                        {Array.from({ length: deviceInfo.tuners }, (_, i) => (
-                          <MenuItem key={i} value={i}>Tuner {i}</MenuItem>
-                        ))}
+                        {Array.from({ length: deviceInfo.tuners }, (_, i) => {
+                          const stateText = tunerStateText(tunerStatus?.tunerStates?.[i]);
+                          return (
+                            <MenuItem key={i} value={i}>Tuner {i}{stateText ? ` (${stateText})` : ''}</MenuItem>
+                          );
+                        })}
                       </Select>
                     </FormControl>
                   )}
