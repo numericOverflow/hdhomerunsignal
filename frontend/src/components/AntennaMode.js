@@ -14,6 +14,7 @@ import {
 import { Close as CloseIcon } from '@mui/icons-material';
 import StationPicker, { tunerStateText } from './StationPicker';
 import { getClientId } from '../clientId';
+import { staleText } from '../staleText';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -125,9 +126,9 @@ function AntennaMode({ allTunersData, deviceId }) {
   useEffect(() => {
     if (!deviceId || !allTunersData || allTunersData.length === 0) return;
 
-    allTunersData.forEach(({ tuner, status }) => {
-      // No status means a failed read, not an untuned tuner. Keep what we have.
-      if (!status) return;
+    allTunersData.forEach(({ tuner, status, stale }) => {
+      // A stale reading repeats the last good values: not a channel change, keep what we have
+      if (stale || !status) return;
 
       const channel = status.channel;
       const fetchState = programFetchRef.current[tuner];
@@ -197,9 +198,9 @@ function AntennaMode({ allTunersData, deviceId }) {
     setHistoryData(prev => {
       const newHistory = { ...prev };
 
-      allTunersData.forEach(({ tuner, status }) => {
-        // No status means a failed read. Skip this sample instead of treating it as a channel change.
-        if (!status) return;
+      allTunersData.forEach(({ tuner, status, stale }) => {
+        // A stale reading repeats the last good values: no new sample, and not a channel change
+        if (stale || !status) return;
 
         const currentChannel = status.channel || 'none';
         const lastChannel = lastChannelRef.current[tuner];
@@ -384,7 +385,7 @@ function AntennaMode({ allTunersData, deviceId }) {
       </Typography>
 
       <Grid container spacing={2}>
-        {allTunersData.map(({ tuner, status, currentProgram, tunerState }) => (
+        {allTunersData.map(({ tuner, status, currentProgram, tunerState, stale, staleForMs }) => (
           <Grid item xs={12} md={6} key={tuner}>
             <Card>
               <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
@@ -412,6 +413,12 @@ function AntennaMode({ allTunersData, deviceId }) {
                 {tunerState && (
                   <Typography variant="caption" sx={{ display: 'block', mb: 0.5, color: tunerState.state === 'in-use' ? 'warning.main' : 'text.secondary' }}>
                     {tunerStateText(tunerState)}
+                  </Typography>
+                )}
+
+                {stale && (
+                  <Typography variant="caption" sx={{ display: 'block', mb: 0.5, color: 'warning.main' }}>
+                    {staleText(staleForMs)}
                   </Typography>
                 )}
 

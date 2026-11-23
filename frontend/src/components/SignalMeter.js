@@ -74,6 +74,7 @@ import io from 'socket.io-client';
 import AntennaMode from './AntennaMode';
 import StationPicker, { tunerStateText } from './StationPicker';
 import { getClientId } from '../clientId';
+import { staleText } from '../staleText';
 
 // Register Chart.js components
 ChartJS.register(
@@ -423,7 +424,8 @@ function SignalMeter() {
 
   // Update signal history whenever tunerStatus changes
   useEffect(() => {
-    if (!tunerStatus) return;
+    // A stale reading repeats the last good values: no new sample, and not a channel change
+    if (!tunerStatus || tunerStatus.stale) return;
 
     const currentChannel = tunerStatus.channel || 'none';
 
@@ -644,6 +646,7 @@ function SignalMeter() {
 
   // Track start/peak signal values for the currently tuned channel
   useEffect(() => {
+    if (tunerStatus?.stale) return;
     const channel = tunerStatus?.channel;
     if (!channel || channel === 'none') {
       setSignalStats(null);
@@ -1115,6 +1118,11 @@ function SignalMeter() {
                   <Typography variant="h6" sx={{ fontSize: '1.1rem', minWidth: 'fit-content' }}>
                     {!tunerStatus?.channel || tunerStatus.channel === 'none' ? 'Stopped' : tunerStatus.channel}
                   </Typography>
+                  {tunerStatus?.stale && (
+                    <Typography variant="caption" sx={{ color: 'warning.main' }}>
+                      {staleText(tunerStatus.staleForMs)}
+                    </Typography>
+                  )}
 
                   <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, flexWrap: 'wrap' }}>
                     <TextField
