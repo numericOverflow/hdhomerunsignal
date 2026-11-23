@@ -730,8 +730,14 @@ class HDHomeRunController {
             }
           });
 
-          // If no programs found and we have retries left, try again
-          if (programs.length === 0 && attempt < maxRetries) {
+          // The device reports "program=3: 0 (no data)" until it has the station's
+          // guide data (PSIP). Mark those entries so callers can fetch again later.
+          programs.forEach(program => {
+            program.noData = program.virtualChannel === '0' || /no data/i.test(`${program.name} ${program.status}`);
+          });
+
+          // If no programs found, or some have no guide data yet, and we have retries left, try again
+          if ((programs.length === 0 || programs.some(p => p.noData)) && attempt < maxRetries) {
             attempt++;
             setTimeout(tryGetPrograms, 2000); // Wait longer for ATSC 3.0
             return;
