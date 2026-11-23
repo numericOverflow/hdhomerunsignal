@@ -36,7 +36,8 @@ import {
   TableHead,
   TableRow,
   ToggleButton,
-  ToggleButtonGroup
+  ToggleButtonGroup,
+  Tooltip
 } from '@mui/material';
 import {
   Refresh as RefreshIcon,
@@ -64,7 +65,7 @@ import {
   PointElement,
   LineElement,
   Title,
-  Tooltip,
+  Tooltip as ChartTooltip,
   Legend,
   Filler
 } from 'chart.js';
@@ -79,7 +80,7 @@ ChartJS.register(
   PointElement,
   LineElement,
   Title,
-  Tooltip,
+  ChartTooltip,
   Legend,
   Filler
 );
@@ -89,7 +90,8 @@ const MAX_SIGNAL_HISTORY = 60; // 60 seconds of data
 const REGIONS = [
   { value: 'us', label: 'United States' },
   { value: 'ca', label: 'Canada' },
-  { value: 'eu', label: 'United Kingdom / EU' }
+  { value: 'eu', label: 'United Kingdom / EU' },
+  { value: 'au', label: 'Australia' }
 ];
 
 const CHANNEL_MAPS = {
@@ -108,7 +110,18 @@ const CHANNEL_MAPS = {
   eu: [
     { value: 'eu-bcast', label: 'UK/EU Broadcast' },
     { value: 'eu-cable', label: 'UK/EU Cable' }
+  ],
+  au: [
+    { value: 'au-bcast', label: 'AU Broadcast' },
+    { value: 'au-cable', label: 'AU Cable' }
   ]
+};
+
+const DEFAULT_CHANNEL_MAP = {
+  us: 'us-bcast',
+  ca: 'ca-bcast',
+  eu: 'eu-bcast',
+  au: 'au-bcast'
 };
 
 // Convert frequency (in Hz) to broadcast channel number
@@ -130,6 +143,26 @@ function frequencyToChannel(freqHz, region = 'us') {
       // Channel 21: 474 MHz center, then +8 MHz for each channel
       const channel = Math.round((freqMhz - 474) / 8) + 21;
       return Math.max(21, Math.min(60, channel));
+    }
+
+    return null; // Unknown frequency range
+  }
+
+  if (region === 'au') {
+    // Australian DVB-T frequencies (7 MHz raster)
+    // Band III (VHF): channels 6-12 with 9A (205.5 MHz) between 9 and 10
+    if (freqMhz >= 174 && freqMhz <= 230) {
+      const slot = Math.round((freqMhz - 177.5) / 7); // 0 = ch6 ... 4 = 9A ... 7 = ch12
+      if (slot === 4) return '9A';
+      const channel = slot < 4 ? slot + 6 : slot + 5;
+      return Math.max(6, Math.min(12, channel));
+    }
+
+    // Band IV/V (UHF): channels 28-51 (post digital dividend, 526-694 MHz)
+    if (freqMhz >= 526 && freqMhz <= 694) {
+      // Channel 28: 529.5 MHz center, then +7 MHz for each channel
+      const channel = Math.round((freqMhz - 529.5) / 7) + 28;
+      return Math.max(28, Math.min(51, channel));
     }
 
     return null; // Unknown frequency range
@@ -174,6 +207,10 @@ function frequencyToChannel(freqHz, region = 'us') {
 
 // Convert broadcast channel number to center frequency (in Hz)
 function channelToFrequency(channel, region = 'us') {
+  if (region === 'au' && String(channel).toUpperCase() === '9A') {
+    return 205.5 * 1000000;
+  }
+
   const ch = parseInt(channel, 10);
   if (isNaN(ch)) return null;
 
@@ -185,6 +222,21 @@ function channelToFrequency(channel, region = 'us') {
     // Band IV/V (UHF): channels 21-60
     if (ch >= 21 && ch <= 60) {
       return ((ch - 21) * 8 + 474) * 1000000;
+    }
+    return null;
+  }
+
+  if (region === 'au') {
+    // Band III (VHF): channels 6-9, then 10-12 shifted up past 9A
+    if (ch >= 6 && ch <= 9) {
+      return ((ch - 6) * 7 + 177.5) * 1000000;
+    }
+    if (ch >= 10 && ch <= 12) {
+      return ((ch - 10) * 7 + 212.5) * 1000000;
+    }
+    // Band IV/V (UHF): channels 28-51
+    if (ch >= 28 && ch <= 51) {
+      return ((ch - 28) * 7 + 529.5) * 1000000;
     }
     return null;
   }
@@ -207,11 +259,91 @@ function channelToFrequency(channel, region = 'us') {
   return null;
 }
 
+function getSignalColor(value) {
+  if (value >= 80) return '#4CAF50';
+  if (value >= 60) return '#FF9800';
+  return '#F44336';
+}
+
+// Fold one status reading into a metric's session stats. Each metric latches its
+// own baseline on its first non-zero reading: the device reports lock=none with
+// 0/0/0 while it is still acquiring, and the three values do not come up together,
+// so a shared baseline pins whichever metric arrives last at 0.
+function trackMetric(prev, raw) {
+  const value = raw || 0;
+  if (!prev) return { initial: value > 0 ? value : null, max: value };
+  const initial = prev.initial === null && value > 0 ? value : prev.initial;
+  if (initial === prev.initial && value <= prev.max) return prev;
+  return { initial, max: Math.max(prev.max, value) };
+}
+
+// Signal bar with optional session markers: a dimmed high-water fill behind the
+// live bar, and a caret under the track showing the reading when we first locked
+// this channel. Together they show at a glance whether an antenna nudge helped.
+function SignalBar({ value, stats }) {
+  const current = value || 0;
+  const peak = stats ? Math.max(stats.max, current) : null;
+  const initial = stats && stats.initial !== null ? stats.initial : null;
+  const tip = stats
+    ? `Now ${current}% \u00b7 Start ${initial === null ? '\u2014' : initial + '%'} \u00b7 Peak ${peak}%`
+    : '';
+
+  return (
+    <Tooltip title={tip} placement="top" arrow enterDelay={200} disableInteractive>
+    <Box>
+      <Box sx={{ position: 'relative', height: 8 }}>
+        <Box sx={{ position: 'absolute', inset: 0, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.1)' }} />
+        {peak !== null && (
+          <Box sx={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: `${peak}%`,
+            borderRadius: 4,
+            backgroundColor: getSignalColor(peak),
+            opacity: 0.3
+          }} />
+        )}
+        <LinearProgress
+          variant="determinate"
+          value={current}
+          sx={{
+            position: 'absolute',
+            inset: 0,
+            height: 8,
+            borderRadius: 4,
+            backgroundColor: 'transparent',
+            '& .MuiLinearProgress-bar': { backgroundColor: getSignalColor(current) }
+          }}
+        />
+      </Box>
+      <Box sx={{ position: 'relative', height: 9 }}>
+        {initial !== null && (
+          <Box sx={{
+            position: 'absolute',
+            left: `${initial}%`,
+            transform: 'translateX(-50%)',
+            fontSize: '0.5rem',
+            lineHeight: 1,
+            color: 'text.secondary',
+            opacity: 0.65,
+            userSelect: 'none'
+          }}>
+            &#9650;
+          </Box>
+        )}
+      </Box>
+    </Box>
+    </Tooltip>
+  );
+}
+
 // Get channel range for region
 function getChannelRange(region) {
-  return region === 'eu'
-    ? { min: 5, max: 60 }  // EU: VHF 5-12, UHF 21-60
-    : { min: 2, max: 36 }; // US: VHF 2-13, UHF 14-36
+  if (region === 'eu') return { min: 5, max: 60 }; // EU: VHF 5-12, UHF 21-60
+  if (region === 'au') return { min: 6, max: 51 }; // AU: VHF 6-12, UHF 28-51
+  return { min: 2, max: 36 };                      // US: VHF 2-13, UHF 14-36
 }
 
 function SignalMeter() {
@@ -226,7 +358,7 @@ function SignalMeter() {
   const [selectedTuner, setSelectedTuner] = useState(0);
   const [channelMap, setChannelMap] = useState(() => {
     // Set default channel map based on region
-    return region === 'eu' ? 'eu-bcast' : 'us-bcast';
+    return DEFAULT_CHANNEL_MAP[region] || 'us-bcast';
   });
   const [selectedChannel, setSelectedChannel] = useState('');
   const [tunerStatus, setTunerStatus] = useState(null);
@@ -242,6 +374,9 @@ function SignalMeter() {
   const [antennaMode, setAntennaMode] = useState(false);
   const [allTunersData, setAllTunersData] = useState([]);
   const [contextMenu, setContextMenu] = useState(null); // { mouseX, mouseY, program }
+  // Per-channel session stats: first locked reading and high-water mark for
+  // ss/snq/seq. Reset whenever the tuned channel (or device/tuner) changes.
+  const [signalStats, setSignalStats] = useState(null);
 
   // Signal history for the chart
   // Pre-fill with nulls so the chart is always MAX_SIGNAL_HISTORY wide;
@@ -503,6 +638,31 @@ function SignalMeter() {
     // the auto-fetch useEffect will repopulate data for the new tuner
   }, [selectedTuner]);
 
+  // Track start/peak signal values for the currently tuned channel
+  useEffect(() => {
+    const channel = tunerStatus?.channel;
+    if (!channel || channel === 'none') {
+      setSignalStats(null);
+      return;
+    }
+    // Hold onto the stats through a momentary loss of lock - dropping out while
+    // the antenna swings shouldn't wipe the reference points.
+    if (!tunerStatus.lock) return;
+
+    const key = `${selectedDevice}|${selectedTuner}|${channel}`;
+
+    setSignalStats((prev) => {
+      const base = prev && prev.key === key ? prev : null;
+      const ss = trackMetric(base?.ss, tunerStatus.ss);
+      const snq = trackMetric(base?.snq, tunerStatus.snq);
+      const seq = trackMetric(base?.seq, tunerStatus.seq);
+      // trackMetric hands back the same object when nothing moved, so this keeps
+      // the idle case from re-rendering three progress bars every status tick.
+      if (base && ss === base.ss && snq === base.snq && seq === base.seq) return base;
+      return { key, ss, snq, seq };
+    });
+  }, [tunerStatus, selectedDevice, selectedTuner]);
+
   // Handle antenna mode switching
   useEffect(() => {
     if (!socket || !selectedDevice || !deviceInfo) return;
@@ -727,12 +887,6 @@ function SignalMeter() {
     }
   };
 
-  const getSignalColor = (value) => {
-    if (value >= 80) return '#4CAF50';
-    if (value >= 60) return '#FF9800';
-    return '#F44336';
-  };
-
   const formatDataRate = (bps) => {
     if (!bps) return '0.000 Mbps';
     return (bps / 1000000).toFixed(3) + ' Mbps';
@@ -841,7 +995,7 @@ function SignalMeter() {
                       const newRegion = e.target.value;
                       setRegion(newRegion);
                       // Reset channel map to default for new region
-                      setChannelMap(newRegion === 'eu' ? 'eu-bcast' : 'us-bcast');
+                      setChannelMap(DEFAULT_CHANNEL_MAP[newRegion]);
                     }}
                   >
                     {REGIONS.map((r) => (
@@ -951,7 +1105,7 @@ function SignalMeter() {
                       onKeyPress={(e) => {
                         if (e.key === 'Enter') tuneToDirectChannel(directChannel);
                       }}
-                      placeholder={region === 'eu' ? '60' : '36'}
+                      placeholder={String(getChannelRange(region).max)}
                       sx={{
                         width: 60,
                         '& .MuiOutlinedInput-root': { paddingLeft: 0, paddingRight: 0 },
@@ -975,43 +1129,46 @@ function SignalMeter() {
                   </Box>
                 </Box>
 
-                {/* Compact Signal Meters */}
+                {/* Compact Signal Display */}
                 {/* Show meters while tuned, also without lock, for antenna aiming */}
-                {tunerStatus?.channel && tunerStatus.channel !== 'none' ? (
+                {tunerStatus?.channel && tunerStatus.channel !== 'none' ? (() => {
+                  // Only show start/peak markers once the stats belong to the channel on screen
+                  const statsKey = `${selectedDevice}|${selectedTuner}|${tunerStatus.channel}`;
+                  const stats = signalStats?.key === statsKey ? signalStats : null;
+                  return (
                   <>
-                    <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center', mb: 1.5 }}>
-                      <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
-                        <Typography variant="body2" sx={{ fontSize: '0.75rem', mb: 0.5 }}>
-                          Signal: {tunerStatus.ss || 0}%
-                          {tunerStatus.ssDb && <span style={{ fontSize: '0.65rem', opacity: 0.8 }}> (~{tunerStatus.ssDb}dBm)</span>}
-                        </Typography>
-                        <LinearProgress variant="determinate" value={tunerStatus.ss || 0} sx={{ height: 8, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.1)', '& .MuiLinearProgress-bar': { backgroundColor: getSignalColor(tunerStatus.ss || 0) } }} />
-                      </Box>
-                      <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
-                        <Typography variant="body2" sx={{ fontSize: '0.75rem', mb: 0.5 }}>
-                          SNR: {tunerStatus.snq || 0}%
-                          {tunerStatus.snrDb && tunerStatus.snrDb > 0 && <span style={{ fontSize: '0.65rem', opacity: 0.8 }}> (~{tunerStatus.snrDb}dB)</span>}
-                        </Typography>
-                        <LinearProgress variant="determinate" value={tunerStatus.snq || 0} sx={{ height: 8, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.1)', '& .MuiLinearProgress-bar': { backgroundColor: getSignalColor(tunerStatus.snq || 0) } }} />
-                      </Box>
-                      <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
-                        <Typography variant="body2" sx={{ fontSize: '0.75rem', mb: 0.5 }}>Sym: {tunerStatus.seq || 0}%</Typography>
-                        <LinearProgress variant="determinate" value={tunerStatus.seq || 0} sx={{ height: 8, borderRadius: 4, backgroundColor: 'rgba(255,255,255,0.1)', '& .MuiLinearProgress-bar': { backgroundColor: getSignalColor(tunerStatus.seq || 0) } }} />
-                      </Box>
-                      <Box sx={{ flex: '1 1 100px', minWidth: 100, textAlign: 'right' }}>
-                        <Typography variant="body2" sx={{ fontSize: '0.75rem' }}>Rate</Typography>
-                        <Typography variant="body1" sx={{ fontSize: '0.9rem', fontWeight: 500 }}>{formatDataRate(tunerStatus.bps)}</Typography>
-                      </Box>
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center', mb: 1.5 }}>
+                    <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
+                      <Typography variant="body2" sx={{ fontSize: '0.75rem', mb: 0.5 }}>
+                        Signal: {tunerStatus.ss || 0}%
+                        {tunerStatus.ssDb && <span style={{ fontSize: '0.65rem', opacity: 0.8 }}> (~{tunerStatus.ssDb}dBm)</span>}
+                      </Typography>
+                      <SignalBar value={tunerStatus.ss} stats={stats?.ss} />
                     </Box>
+                    <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
+                      <Typography variant="body2" sx={{ fontSize: '0.75rem', mb: 0.5 }}>
+                        SNR: {tunerStatus.snq || 0}%
+                        {tunerStatus.snrDb && tunerStatus.snrDb > 0 && <span style={{ fontSize: '0.65rem', opacity: 0.8 }}> (~{tunerStatus.snrDb}dB)</span>}
+                      </Typography>
+                      <SignalBar value={tunerStatus.snq} stats={stats?.snq} />
+                    </Box>
+                    <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
+                      <Typography variant="body2" sx={{ fontSize: '0.75rem', mb: 0.5 }}>Sym: {tunerStatus.seq || 0}%</Typography>
+                      <SignalBar value={tunerStatus.seq} stats={stats?.seq} />
+                    </Box>
+                    <Box sx={{ flex: '1 1 100px', minWidth: 100, textAlign: 'right' }}>
+                      <Typography variant="body2" sx={{ fontSize: '0.75rem' }}>Rate</Typography>
+                      <Typography variant="body1" sx={{ fontSize: '0.9rem', fontWeight: 500 }}>{formatDataRate(tunerStatus.bps)}</Typography>
+                    </Box>
+                  </Box>
 
-                    {/* Signal + SNR History Chart */}
-                    {(
-                      <Box sx={{ height: 180, mt: 0.5 }}>
-                        <Line data={signalChartData} options={signalChartOptions} />
-                      </Box>
-                    )}
+                  {/* Signal + SNR History Chart */}
+                  <Box sx={{ height: 180, mt: 0.5 }}>
+                    <Line data={signalChartData} options={signalChartOptions} />
+                  </Box>
                   </>
-                ) : (
+                  );
+                })() : (
                   <Typography variant="body2" sx={{ textAlign: 'center', py: 1, color: 'text.secondary' }}>
                     No signal detected
                   </Typography>
