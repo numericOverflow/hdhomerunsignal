@@ -105,6 +105,8 @@ function formatChannelDisplay(channelStr) {
 
 const PROGRAM_FETCH_MAX_ATTEMPTS = 3;
 const PROGRAM_FETCH_RETRY_MS = 5000;
+// While some programs show "0 (no data)", fetch again at this interval, with no attempt limit
+const PROGRAM_NO_DATA_RETRY_MS = 10000;
 
 function AntennaMode({ allTunersData, deviceId }) {
   const [historyData, setHistoryData] = useState({});
@@ -124,7 +126,10 @@ function AntennaMode({ allTunersData, deviceId }) {
     if (!deviceId || !allTunersData || allTunersData.length === 0) return;
 
     allTunersData.forEach(({ tuner, status }) => {
-      const channel = status?.channel;
+      // No status means a failed read, not an untuned tuner. Keep what we have.
+      if (!status) return;
+
+      const channel = status.channel;
       const fetchState = programFetchRef.current[tuner];
 
       if (!channel || channel === 'none') {
@@ -170,8 +175,14 @@ function AntennaMode({ allTunersData, deviceId }) {
           if (programFetchRef.current[tuner] !== state) return;
           state.inFlight = false;
           if (Array.isArray(programs) && programs.length > 0) {
-            state.done = true;
             setProgramsByTuner(prev => ({ ...prev, [tuner]: programs }));
+            if (programs.some(program => program.noData)) {
+              // Guide data not complete yet: show what we have and fetch again later
+              state.attempts = 0;
+              state.nextAt = Date.now() + PROGRAM_NO_DATA_RETRY_MS;
+            } else {
+              state.done = true;
+            }
           } else {
             state.nextAt = Date.now() + PROGRAM_FETCH_RETRY_MS;
           }
@@ -187,7 +198,10 @@ function AntennaMode({ allTunersData, deviceId }) {
       const newHistory = { ...prev };
 
       allTunersData.forEach(({ tuner, status }) => {
-        const currentChannel = status?.channel || 'none';
+        // No status means a failed read. Skip this sample instead of treating it as a channel change.
+        if (!status) return;
+
+        const currentChannel = status.channel || 'none';
         const lastChannel = lastChannelRef.current[tuner];
 
         // Reset history if channel changed for this tuner
@@ -246,7 +260,9 @@ function AntennaMode({ allTunersData, deviceId }) {
       .catch(error => console.error(`Failed to stop test tune on tuner ${tuner}:`, error));
   };
 
-  const formatProgram = (program) => `${program.virtualChannel} ${program.callsign}`;
+  const formatProgram = (program) => (program.noData
+    ? `Program ${program.programNum} (waiting for guide data)`
+    : `${program.virtualChannel} ${program.callsign}`);
 
   // Compact line: one program chip plus "+N more" with the full list in a tooltip.
   // The active program (the one a client is watching) is shown first as a filled chip.
