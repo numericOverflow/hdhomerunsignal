@@ -798,14 +798,18 @@ class HDHomeRunController {
 
     const intervalId = setInterval(async () => {
       try {
-        // Monitor all tuners simultaneously
+        // Monitor all tuners simultaneously. currentProgram is the program
+        // number a client is filtering (null when the whole RF channel is open).
         const allTunersData = await Promise.all(
           Array.from({ length: tunerCount }, (_, i) =>
-            this.getTunerStatus(deviceId, i)
-              .then(status => ({ tuner: i, status }))
+            Promise.all([
+              this.getTunerStatus(deviceId, i),
+              this.getCurrentProgram(deviceId, i)
+            ])
+              .then(([status, currentProgram]) => ({ tuner: i, status, currentProgram }))
               .catch(error => {
                 console.error(`Error monitoring tuner ${i}:`, error);
-                return { tuner: i, status: null };
+                return { tuner: i, status: null, currentProgram: null };
               })
           )
         );
