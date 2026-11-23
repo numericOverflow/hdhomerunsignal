@@ -401,7 +401,11 @@ class HDHomeRunController {
           }
         });
 
-        status.lock = status.lock !== undefined;
+        // lock=<modulation> (for example 8vsb) means locked. lock=none means no lock.
+        // A value in parentheses, for example (8vsb), is a detected but unsupported modulation.
+        status.lock = typeof status.lock === 'string' &&
+                       status.lock !== 'none' &&
+                       !status.lock.startsWith('(');
         
         // Extract dB values from debug output with educated conversion
         if (debugResult) {
