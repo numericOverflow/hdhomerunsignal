@@ -295,7 +295,8 @@ function SignalMeter() {
     }
     lastChannelForChartRef.current = currentChannel;
 
-    if (currentChannel === 'none' || !tunerStatus.lock) return;
+    // Record samples while tuned, also without lock, so weak channels still chart
+    if (currentChannel === 'none') return;
 
     setSignalHistory(prev => {
       // Always keep exactly MAX_SIGNAL_HISTORY slots; shift left, push new value on right
@@ -975,7 +976,8 @@ function SignalMeter() {
                 </Box>
 
                 {/* Compact Signal Meters */}
-                {tunerStatus?.lock ? (
+                {/* Show meters while tuned, also without lock, for antenna aiming */}
+                {tunerStatus?.channel && tunerStatus.channel !== 'none' ? (
                   <>
                     <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, alignItems: 'center', mb: 1.5 }}>
                       <Box sx={{ flex: '1 1 120px', minWidth: 120 }}>
