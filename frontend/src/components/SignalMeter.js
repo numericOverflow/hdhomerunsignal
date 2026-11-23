@@ -667,6 +667,15 @@ function SignalMeter() {
     });
   }, [tunerStatus, selectedDevice, selectedTuner]);
 
+  // Free the tuners this browser test-tuned in Antenna Mode when the user leaves it
+  const wasAntennaModeRef = useRef(false);
+  useEffect(() => {
+    if (wasAntennaModeRef.current && !antennaMode && socket && selectedDevice) {
+      socket.emit('release-test-tunes', { deviceId: selectedDevice, source: 'antenna' });
+    }
+    wasAntennaModeRef.current = antennaMode;
+  }, [antennaMode, socket, selectedDevice]);
+
   // Handle antenna mode switching
   useEffect(() => {
     if (!socket || !selectedDevice || !deviceInfo) return;

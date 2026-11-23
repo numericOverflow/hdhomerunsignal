@@ -8,8 +8,12 @@ import {
   Chip,
   Grid,
   Paper,
+  IconButton,
   Tooltip as MuiTooltip
 } from '@mui/material';
+import { Close as CloseIcon } from '@mui/icons-material';
+import StationPicker, { tunerStateText } from './StationPicker';
+import { getClientId } from '../clientId';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -236,6 +240,12 @@ function AntennaMode({ allTunersData, deviceId }) {
     return 'No Signal';
   };
 
+  // Free a tuner this browser tuned for testing
+  const stopTestTune = (tuner) => {
+    axios.post(`/api/devices/${deviceId}/tuner/${tuner}/clear`, { clientId: getClientId() })
+      .catch(error => console.error(`Failed to stop test tune on tuner ${tuner}:`, error));
+  };
+
   const formatProgram = (program) => `${program.virtualChannel} ${program.callsign}`;
 
   // Compact line: one program chip plus "+N more" with the full list in a tooltip.
@@ -358,7 +368,7 @@ function AntennaMode({ allTunersData, deviceId }) {
       </Typography>
 
       <Grid container spacing={2}>
-        {allTunersData.map(({ tuner, status, currentProgram }) => (
+        {allTunersData.map(({ tuner, status, currentProgram, tunerState }) => (
           <Grid item xs={12} md={6} key={tuner}>
             <Card>
               <CardContent sx={{ py: 1.5, '&:last-child': { pb: 1.5 } }}>
@@ -380,6 +390,26 @@ function AntennaMode({ allTunersData, deviceId }) {
                       {formatChannelDisplay(status.channel)}
                     </Typography>
                     {renderPrograms(programsByTuner[tuner], currentProgram)}
+                  </Box>
+                )}
+
+                {tunerState && (
+                  <Typography variant="caption" sx={{ display: 'block', mb: 0.5, color: tunerState.state === 'in-use' ? 'warning.main' : 'text.secondary' }}>
+                    {tunerStateText(tunerState)}
+                  </Typography>
+                )}
+
+                {/* Test tune: only on a tuner this browser may change */}
+                {tunerState && tunerState.state !== 'in-use' && (
+                  <Box sx={{ display: 'flex', alignItems: 'flex-start', gap: 0.5, mb: 1 }}>
+                    <Box sx={{ flex: 1 }}>
+                      <StationPicker deviceId={deviceId} tuner={tuner} tunerState={tunerState} source="antenna" />
+                    </Box>
+                    {tunerState.state === 'controlled' && (
+                      <IconButton size="small" onClick={() => stopTestTune(tuner)} aria-label="Stop test tune">
+                        <CloseIcon fontSize="small" />
+                      </IconButton>
+                    )}
                   </Box>
                 )}
 
