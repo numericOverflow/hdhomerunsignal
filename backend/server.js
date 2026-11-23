@@ -2,6 +2,7 @@ const express = require('express');
 const { createServer } = require('http');
 const { Server } = require('socket.io');
 const { exec } = require('child_process');
+const http = require('http');
 const https = require('https');
 const path = require('path');
 const cors = require('cors');
@@ -19,6 +20,41 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Virtual channel such as 11.1 or 102.1. Strict, because the value goes into a shell command.
+const VCHANNEL_PATTERN = /^\d{1,4}(\.\d{1,4})?$/;
+const LINEUP_TTL_MS = 10 * 60 * 1000;
+
+function compareVchannel(a, b) {
+  const [aMajor, aMinor = 0] = a.vchannel.split('.').map(Number);
+  const [bMajor, bMinor = 0] = b.vchannel.split('.').map(Number);
+  return aMajor - bMajor || aMinor - bMinor;
+}
+
+// GET a JSON document from the device web server. Resolves null on any failure.
+function fetchDeviceJson(host, urlPath, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const req = http.get({ host, port: 80, path: urlPath, timeout: timeoutMs }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        resolve(null);
+        return;
+      }
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (error) {
+          resolve(null);
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+}
+
 class HDHomeRunController {
   constructor() {
     this.devices = [];
@@ -28,6 +64,39 @@ class HDHomeRunController {
     this.deviceNameCache = new Map(); // Cache for device name lookups
     this.cacheTTL = 5 * 60 * 1000; // 5 minute TTL
     this.httpDiscoveryCache = null; // Cached HTTP API results; only refreshed on explicit user request
+    this.lineupCache = new Map(); // deviceId -> { at, stations }
+  }
+
+  getDeviceIp(deviceId) {
+    const device = this.devices.find(d => d.id === deviceId);
+    return device?.ip || null;
+  }
+
+  // Station list from the device's own channel scan (lineup.json), sorted by virtual channel
+  async getLineup(deviceId, force = false) {
+    const cached = this.lineupCache.get(deviceId);
+    if (!force && cached && Date.now() - cached.at < LINEUP_TTL_MS) {
+      return cached.stations;
+    }
+
+    const ip = this.getDeviceIp(deviceId);
+    if (!ip) return cached ? cached.stations : null;
+
+    const raw = await fetchDeviceJson(ip, '/lineup.json');
+    if (!Array.isArray(raw)) return cached ? cached.stations : null;
+
+    const stations = raw
+      .filter(entry => VCHANNEL_PATTERN.test(String(entry.GuideNumber || '')))
+      .map(entry => ({
+        vchannel: String(entry.GuideNumber),
+        name: entry.GuideName || '',
+        atsc3: entry.VideoCodec === 'HEVC' || entry.AudioCodec === 'AC4',
+        drm: entry.DRM === 1
+      }))
+      .sort(compareVchannel);
+
+    this.lineupCache.set(deviceId, { at: Date.now(), stations });
+    return stations;
   }
 
   async discoverDevices(forceRefresh = false) {
@@ -853,6 +922,19 @@ app.get('/api/devices/:id/info', async (req, res) => {
   try {
     const info = await hdhrController.getDeviceInfo(req.params.id);
     res.json(info);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/devices/:id/lineup', async (req, res) => {
+  try {
+    const stations = await hdhrController.getLineup(req.params.id, req.query.force === 'true');
+    if (!stations) {
+      res.status(502).json({ error: 'Could not read the station list (lineup.json) from the device' });
+      return;
+    }
+    res.json(stations);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
