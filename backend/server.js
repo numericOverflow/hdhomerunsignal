@@ -23,6 +23,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Virtual channel such as 11.1 or 102.1. Strict, because the value goes into a shell command.
 const VCHANNEL_PATTERN = /^\d{1,4}(\.\d{1,4})?$/;
 const LINEUP_TTL_MS = 10 * 60 * 1000;
+const TARGETS_TTL_MS = 3000;
+// Kill a hdhomerun_config call that hangs, so a stuck call cannot block the status loop
+const DEVICE_CALL_TIMEOUT_MS = 3000;
+// Failed reads in a row that the status loop hides by reusing the last good reading
+const MAX_HELD_READS = 3;
 
 function compareVchannel(a, b) {
   const [aMajor, aMinor = 0] = a.vchannel.split('.').map(Number);
@@ -65,6 +70,8 @@ class HDHomeRunController {
     this.cacheTTL = 5 * 60 * 1000; // 5 minute TTL
     this.httpDiscoveryCache = null; // Cached HTTP API results; only refreshed on explicit user request
     this.lineupCache = new Map(); // deviceId -> { at, stations }
+    this.targetsCache = new Map(); // deviceId -> { at, targets, refreshing }
+    this.readFailures = { count: 0, last: '', loggedAt: 0 };
   }
 
   getDeviceIp(deviceId) {
@@ -85,6 +92,43 @@ class HDHomeRunController {
       if (match) targets[match[1]] = entry.TargetIP || null;
     });
     return targets;
+  }
+
+  // Last known status.json targets, refreshed in the background at most every
+  // TARGETS_TTL_MS, so a status tick never waits on the device web server.
+  // Returns null until the first read finishes.
+  getTunerTargetsCached(deviceId) {
+    let entry = this.targetsCache.get(deviceId);
+    if (!entry) {
+      entry = { at: 0, targets: null, refreshing: false };
+      this.targetsCache.set(deviceId, entry);
+    }
+    if (!entry.refreshing && Date.now() - entry.at >= TARGETS_TTL_MS) {
+      entry.refreshing = true;
+      this.getTunerTargets(deviceId)
+        .then(targets => {
+          if (targets) entry.targets = targets;
+        })
+        .finally(() => {
+          entry.at = Date.now();
+          entry.refreshing = false;
+        });
+    }
+    return entry.targets;
+  }
+
+  // Count failed hdhomerun_config reads and log a summary at most every 10 s,
+  // so failures show in the container log without flooding it.
+  noteReadFailure(deviceId, command, error) {
+    const now = Date.now();
+    const stats = this.readFailures;
+    stats.count += 1;
+    stats.last = `${deviceId} ${command}: ${(error.stderr || error.message || '').trim().split('\n')[0]}`;
+    if (now - stats.loggedAt >= 10000) {
+      console.warn(`hdhomerun_config read failures in the last ${Math.round((now - stats.loggedAt) / 1000)} s: ${stats.count}. Last: ${stats.last}`);
+      stats.count = 0;
+      stats.loggedAt = now;
+    }
   }
 
   // Station list from the device's own channel scan (lineup.json), sorted by virtual channel
@@ -526,8 +570,9 @@ class HDHomeRunController {
 
   async getStatusCommand(deviceId, tuner, command) {
     return new Promise((resolve) => {
-      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/${command}`, (error, stdout) => {
+      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/${command}`, { timeout: DEVICE_CALL_TIMEOUT_MS }, (error, stdout) => {
         if (error) {
+          this.noteReadFailure(deviceId, `tuner${tuner}/${command}`, error);
           resolve(null);
         } else {
           resolve(stdout.trim());
@@ -606,8 +651,9 @@ class HDHomeRunController {
 
   async getCurrentProgram(deviceId, tuner = 0) {
     return new Promise((resolve, reject) => {
-      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/program`, (error, stdout) => {
+      exec(`hdhomerun_config ${deviceId} get /tuner${tuner}/program`, { timeout: DEVICE_CALL_TIMEOUT_MS }, (error, stdout) => {
         if (error) {
+          this.noteReadFailure(deviceId, `tuner${tuner}/program`, error);
           resolve(null);
           return;
         }
@@ -860,97 +906,121 @@ class HDHomeRunController {
     });
   }
 
-  startMonitoring(socket, deviceId, tuner) {
+  // Run tick about once per period, but never start a tick before the last one
+  // finished. setInterval with an async tick lets slow ticks overlap, the device
+  // calls then pile up, get slower, and fail.
+  runLoop(socket, tick, periodMs = 1000) {
     this.stopMonitoring(socket);
-
-    const intervalId = setInterval(async () => {
+    const loop = { stopped: false, timer: null };
+    const run = async () => {
+      if (loop.stopped) return;
+      const startedAt = Date.now();
       try {
-        const [status, currentProgram, targets] = await Promise.all([
-          this.getTunerStatus(deviceId, tuner),
-          this.getCurrentProgram(deviceId, tuner),
-          this.getTunerTargets(deviceId)
-        ]);
-
-        // Free / controlled / in-use for every tuner, for the tuner selector and the station picker
-        const tunerIndexes = targets ? Object.keys(targets).map(Number) : [Number(tuner)];
-        const tunerStates = testTunes.statesFor(deviceId, tunerIndexes, targets, { [Number(tuner)]: status }, socket.data.clientId);
-
-        // Get ATSC 3.0 info if channel is tuned and device supports it
-        let plpInfo = null;
-        let l1Info = null;
-        if (status && status.channel && status.channel !== 'none') {
-          // Try to get ATSC 3.0 info - will return null if not ATSC 3.0
-          plpInfo = await this.getPlpInfo(deviceId, tuner);
-          l1Info = await this.getL1Info(deviceId, tuner);
-        }
-
-        socket.emit('tuner-status', {
-          ...status,
-          currentProgram,
-          plpInfo,
-          l1Info,
-          tunerStates
-        });
+        await tick();
       } catch (error) {
         console.error('Monitoring error:', error);
       }
-    }, 1000);
+      if (loop.stopped) return;
+      loop.timer = setTimeout(run, Math.max(0, periodMs - (Date.now() - startedAt)));
+    };
+    loop.timer = setTimeout(run, periodMs);
+    this.monitoringIntervals.set(socket.id, loop);
+  }
 
-    this.monitoringIntervals.set(socket.id, intervalId);
+  startMonitoring(socket, deviceId, tuner) {
+    const held = new Map();
+
+    this.runLoop(socket, async () => {
+      const [rawStatus, rawProgram] = await Promise.all([
+        this.getTunerStatus(deviceId, tuner),
+        this.getCurrentProgram(deviceId, tuner)
+      ]);
+      const { status, currentProgram } = this.holdLastGood(held, tuner, rawStatus, rawProgram);
+      const targets = this.getTunerTargetsCached(deviceId);
+
+      // Free / controlled / in-use for every tuner, for the tuner selector and the station picker
+      const tunerIndexes = targets ? Object.keys(targets).map(Number) : [Number(tuner)];
+      const tunerStates = testTunes.statesFor(deviceId, tunerIndexes, targets, { [Number(tuner)]: status }, socket.data.clientId);
+
+      // Get ATSC 3.0 info if channel is tuned and device supports it
+      let plpInfo = null;
+      let l1Info = null;
+      if (status && status.channel && status.channel !== 'none') {
+        // Try to get ATSC 3.0 info - will return null if not ATSC 3.0
+        plpInfo = await this.getPlpInfo(deviceId, tuner);
+        l1Info = await this.getL1Info(deviceId, tuner);
+      }
+
+      socket.emit('tuner-status', {
+        ...status,
+        currentProgram,
+        plpInfo,
+        l1Info,
+        tunerStates
+      });
+    });
   }
 
   startAntennaMode(socket, deviceId, tunerCount) {
-    this.stopMonitoring(socket);
-
     console.log(`Starting antenna mode for device ${deviceId} with ${tunerCount} tuners`);
+    const held = new Map();
 
-    const intervalId = setInterval(async () => {
-      try {
-        // Monitor all tuners simultaneously. currentProgram is the program
-        // number a client is filtering (null when the whole RF channel is open).
-        const [allTunersData, targets] = await Promise.all([
-          Promise.all(
-            Array.from({ length: tunerCount }, (_, i) =>
-              Promise.all([
-                this.getTunerStatus(deviceId, i),
-                this.getCurrentProgram(deviceId, i)
-              ])
-                .then(([status, currentProgram]) => ({ tuner: i, status, currentProgram }))
-                .catch(error => {
-                  console.error(`Error monitoring tuner ${i}:`, error);
-                  return { tuner: i, status: null, currentProgram: null };
-                })
-            )
-          ),
-          this.getTunerTargets(deviceId)
-        ]);
+    this.runLoop(socket, async () => {
+      // Monitor all tuners simultaneously. currentProgram is the program
+      // number a client is filtering (null when the whole RF channel is open).
+      const allTunersData = await Promise.all(
+        Array.from({ length: tunerCount }, (_, i) =>
+          Promise.all([
+            this.getTunerStatus(deviceId, i),
+            this.getCurrentProgram(deviceId, i)
+          ])
+            .then(([rawStatus, rawProgram]) => ({ tuner: i, ...this.holdLastGood(held, i, rawStatus, rawProgram) }))
+            .catch(error => {
+              console.error(`Error monitoring tuner ${i}:`, error);
+              return { tuner: i, status: null, currentProgram: null };
+            })
+        )
+      );
+      const targets = this.getTunerTargetsCached(deviceId);
 
-        const statuses = {};
-        allTunersData.forEach(({ tuner, status }) => { statuses[tuner] = status; });
-        const tunerStates = testTunes.statesFor(
-          deviceId,
-          allTunersData.map(({ tuner }) => tuner),
-          targets,
-          statuses,
-          socket.data.clientId
-        );
+      const statuses = {};
+      allTunersData.forEach(({ tuner, status }) => { statuses[tuner] = status; });
+      const tunerStates = testTunes.statesFor(
+        deviceId,
+        allTunersData.map(({ tuner }) => tuner),
+        targets,
+        statuses,
+        socket.data.clientId
+      );
 
-        socket.emit('antenna-mode-status', allTunersData.map(item => ({
-          ...item,
-          tunerState: tunerStates[item.tuner]
-        })));
-      } catch (error) {
-        console.error('Antenna mode monitoring error:', error);
-      }
-    }, 1000);
+      socket.emit('antenna-mode-status', allTunersData.map(item => ({
+        ...item,
+        tunerState: tunerStates[item.tuner]
+      })));
+    });
+  }
 
-    this.monitoringIntervals.set(socket.id, intervalId);
+  // A failed device read returns null. Reuse the last good reading for up to
+  // MAX_HELD_READS ticks, so one failed read does not show "No Signal" and reset the charts.
+  holdLastGood(held, tuner, status, currentProgram) {
+    const last = held.get(tuner);
+    if (status) {
+      held.set(tuner, { status, currentProgram, misses: 0 });
+      return { status, currentProgram };
+    }
+    if (last && last.misses < MAX_HELD_READS) {
+      last.misses += 1;
+      return { status: last.status, currentProgram: last.currentProgram };
+    }
+    return { status, currentProgram };
   }
 
   stopMonitoring(socket) {
     const socketId = socket?.id;
     if (socketId && this.monitoringIntervals.has(socketId)) {
-      clearInterval(this.monitoringIntervals.get(socketId));
+      const loop = this.monitoringIntervals.get(socketId);
+      loop.stopped = true;
+      clearTimeout(loop.timer);
       this.monitoringIntervals.delete(socketId);
     }
   }
