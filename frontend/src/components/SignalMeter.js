@@ -925,7 +925,7 @@ function SignalMeter() {
         {/* Antenna Tuning Mode */}
         {antennaMode && selectedDevice && (
           <Grid item xs={12}>
-            <AntennaMode allTunersData={allTunersData} />
+            <AntennaMode allTunersData={allTunersData} deviceId={selectedDevice} />
           </Grid>
         )}
 

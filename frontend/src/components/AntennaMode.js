@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import axios from 'axios';
 import {
   Box,
   Card,
@@ -6,7 +7,8 @@ import {
   Typography,
   Chip,
   Grid,
-  Paper
+  Paper,
+  Tooltip as MuiTooltip
 } from '@mui/material';
 import { Line } from 'react-chartjs-2';
 import {
@@ -97,9 +99,78 @@ function formatChannelDisplay(channelStr) {
   return channelStr; // Fallback to raw format
 }
 
-function AntennaMode({ allTunersData }) {
+const PROGRAM_FETCH_MAX_ATTEMPTS = 3;
+const PROGRAM_FETCH_RETRY_MS = 5000;
+
+function AntennaMode({ allTunersData, deviceId }) {
   const [historyData, setHistoryData] = useState({});
+  const [programsByTuner, setProgramsByTuner] = useState({});
   const lastChannelRef = useRef({}); // Track last-seen channel per tuner
+  // Per tuner: { channel, attempts, inFlight, done, nextAt }
+  const programFetchRef = useRef({});
+
+  // Reset program data when the device changes
+  useEffect(() => {
+    programFetchRef.current = {};
+    setProgramsByTuner({});
+  }, [deviceId]);
+
+  // Fetch the program list (virtual channel + call sign) once per tuned channel
+  useEffect(() => {
+    if (!deviceId || !allTunersData || allTunersData.length === 0) return;
+
+    allTunersData.forEach(({ tuner, status }) => {
+      const channel = status?.channel;
+      const fetchState = programFetchRef.current[tuner];
+
+      if (!channel || channel === 'none') {
+        if (fetchState) {
+          delete programFetchRef.current[tuner];
+          setProgramsByTuner(prev => {
+            const next = { ...prev };
+            delete next[tuner];
+            return next;
+          });
+        }
+        return;
+      }
+
+      if (!fetchState || fetchState.channel !== channel) {
+        programFetchRef.current[tuner] = { channel, attempts: 0, inFlight: false, done: false, nextAt: 0 };
+        setProgramsByTuner(prev => {
+          if (!prev[tuner]) return prev;
+          const next = { ...prev };
+          delete next[tuner];
+          return next;
+        });
+      }
+
+      const state = programFetchRef.current[tuner];
+      if (state.done || state.inFlight || state.attempts >= PROGRAM_FETCH_MAX_ATTEMPTS || Date.now() < state.nextAt) {
+        return;
+      }
+
+      state.inFlight = true;
+      state.attempts += 1;
+      axios.get(`/api/devices/${deviceId}/tuner/${tuner}/programs`)
+        .then(response => response.data)
+        .catch(error => {
+          console.error(`Failed to get programs for tuner ${tuner}:`, error);
+          return [];
+        })
+        .then(programs => {
+          // Ignore the response if the tuner changed channel while the request ran
+          if (programFetchRef.current[tuner] !== state) return;
+          state.inFlight = false;
+          if (Array.isArray(programs) && programs.length > 0) {
+            state.done = true;
+            setProgramsByTuner(prev => ({ ...prev, [tuner]: programs }));
+          } else {
+            state.nextAt = Date.now() + PROGRAM_FETCH_RETRY_MS;
+          }
+        });
+    });
+  }, [allTunersData, deviceId]);
 
   // Update history data when new tuner data arrives
   useEffect(() => {
@@ -160,6 +231,47 @@ function AntennaMode({ allTunersData }) {
     if (symbolQuality === 100) return '100% ✓';
     if (symbolQuality > 0) return `${symbolQuality}%`;
     return 'No Signal';
+  };
+
+  const formatProgram = (program) => `${program.virtualChannel} ${program.callsign}`;
+
+  // Compact line: one program chip plus "+N more" with the full list in a tooltip
+  const renderPrograms = (programs) => {
+    if (!programs || programs.length === 0) return null;
+
+    const primary = programs[0];
+    const others = programs.length - 1;
+
+    return (
+      <>
+        <Chip
+          label={formatProgram(primary)}
+          size="small"
+          color="primary"
+          variant="outlined"
+          sx={{ height: 20, fontSize: '0.7rem' }}
+        />
+        {others > 0 && (
+          <MuiTooltip
+            enterTouchDelay={0}
+            leaveTouchDelay={4000}
+            title={
+              <Box>
+                {programs.map(program => (
+                  <Typography key={program.programNum} variant="caption" component="div">
+                    {formatProgram(program)}
+                  </Typography>
+                ))}
+              </Box>
+            }
+          >
+            <Typography variant="caption" sx={{ fontSize: '0.7rem', color: 'text.secondary', cursor: 'pointer', textDecoration: 'underline dotted' }}>
+              +{others} more
+            </Typography>
+          </MuiTooltip>
+        )}
+      </>
+    );
   };
 
   const createChartData = (tuner, type) => {
@@ -251,9 +363,12 @@ function AntennaMode({ allTunersData }) {
                 </Box>
 
                 {status?.channel && status.channel !== 'none' && (
-                  <Typography variant="body2" sx={{ fontSize: '0.8rem', mb: 1, color: 'text.secondary' }}>
-                    {formatChannelDisplay(status.channel)}
-                  </Typography>
+                  <Box sx={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 1, mb: 1 }}>
+                    <Typography variant="body2" sx={{ fontSize: '0.8rem', color: 'text.secondary' }}>
+                      {formatChannelDisplay(status.channel)}
+                    </Typography>
+                    {renderPrograms(programsByTuner[tuner])}
+                  </Box>
                 )}
 
                 <Grid container spacing={1}>
