@@ -72,6 +72,21 @@ class HDHomeRunController {
     return device?.ip || null;
   }
 
+  // Stream target IP per tuner index from the device status.json, for example { 0: '192.168.1.210', 1: null }.
+  // Resolves null when the device web server cannot be reached.
+  async getTunerTargets(deviceId) {
+    const ip = this.getDeviceIp(deviceId);
+    if (!ip) return null;
+    const raw = await fetchDeviceJson(ip, '/status.json', 1500);
+    if (!Array.isArray(raw)) return null;
+    const targets = {};
+    raw.forEach(entry => {
+      const match = /^tuner(\d+)$/.exec(entry.Resource || '');
+      if (match) targets[match[1]] = entry.TargetIP || null;
+    });
+    return targets;
+  }
+
   // Station list from the device's own channel scan (lineup.json), sorted by virtual channel
   async getLineup(deviceId, force = false) {
     const cached = this.lineupCache.get(deviceId);
@@ -838,8 +853,15 @@ class HDHomeRunController {
 
     const intervalId = setInterval(async () => {
       try {
-        const status = await this.getTunerStatus(deviceId, tuner);
-        const currentProgram = await this.getCurrentProgram(deviceId, tuner);
+        const [status, currentProgram, targets] = await Promise.all([
+          this.getTunerStatus(deviceId, tuner),
+          this.getCurrentProgram(deviceId, tuner),
+          this.getTunerTargets(deviceId)
+        ]);
+
+        // Free / controlled / in-use for every tuner, for the tuner selector and the station picker
+        const tunerIndexes = targets ? Object.keys(targets).map(Number) : [Number(tuner)];
+        const tunerStates = testTunes.statesFor(deviceId, tunerIndexes, targets, { [Number(tuner)]: status }, socket.data.clientId);
 
         // Get ATSC 3.0 info if channel is tuned and device supports it
         let plpInfo = null;
@@ -854,7 +876,8 @@ class HDHomeRunController {
           ...status,
           currentProgram,
           plpInfo,
-          l1Info
+          l1Info,
+          tunerStates
         });
       } catch (error) {
         console.error('Monitoring error:', error);
@@ -873,21 +896,37 @@ class HDHomeRunController {
       try {
         // Monitor all tuners simultaneously. currentProgram is the program
         // number a client is filtering (null when the whole RF channel is open).
-        const allTunersData = await Promise.all(
-          Array.from({ length: tunerCount }, (_, i) =>
-            Promise.all([
-              this.getTunerStatus(deviceId, i),
-              this.getCurrentProgram(deviceId, i)
-            ])
-              .then(([status, currentProgram]) => ({ tuner: i, status, currentProgram }))
-              .catch(error => {
-                console.error(`Error monitoring tuner ${i}:`, error);
-                return { tuner: i, status: null, currentProgram: null };
-              })
-          )
+        const [allTunersData, targets] = await Promise.all([
+          Promise.all(
+            Array.from({ length: tunerCount }, (_, i) =>
+              Promise.all([
+                this.getTunerStatus(deviceId, i),
+                this.getCurrentProgram(deviceId, i)
+              ])
+                .then(([status, currentProgram]) => ({ tuner: i, status, currentProgram }))
+                .catch(error => {
+                  console.error(`Error monitoring tuner ${i}:`, error);
+                  return { tuner: i, status: null, currentProgram: null };
+                })
+            )
+          ),
+          this.getTunerTargets(deviceId)
+        ]);
+
+        const statuses = {};
+        allTunersData.forEach(({ tuner, status }) => { statuses[tuner] = status; });
+        const tunerStates = testTunes.statesFor(
+          deviceId,
+          allTunersData.map(({ tuner }) => tuner),
+          targets,
+          statuses,
+          socket.data.clientId
         );
 
-        socket.emit('antenna-mode-status', allTunersData);
+        socket.emit('antenna-mode-status', allTunersData.map(item => ({
+          ...item,
+          tunerState: tunerStates[item.tuner]
+        })));
       } catch (error) {
         console.error('Antenna mode monitoring error:', error);
       }
@@ -905,7 +944,197 @@ class HDHomeRunController {
   }
 }
 
+const CLIENT_ID_PATTERN = /^[A-Za-z0-9-]{8,64}$/;
+const TUNER_PATTERN = /^\d{1,2}$/;
+
+function parseIdleMinutes(value) {
+  const minutes = Number(value);
+  return Number.isFinite(minutes) && minutes >= 0 ? minutes : 15;
+}
+
+// Tracks tuners that this app tuned for a browser (client ID), and frees them
+// again so a test tune can never hold a tuner forever. The app never takes a
+// resource lock, so a DVR or TV can always take a test tuner; the app then lets go.
+class TestTuneManager {
+  constructor(controller, { idleMs, disconnectGraceMs }) {
+    this.controller = controller;
+    this.idleMs = idleMs;
+    this.disconnectGraceMs = disconnectGraceMs;
+    this.tunes = new Map(); // "deviceId|tuner" -> { deviceId, tuner, clientId, vchannel, source, lastActionAt }
+    this.clientSockets = new Map(); // clientId -> Set of socket IDs
+    this.disconnectTimers = new Map(); // clientId -> timeout
+
+    if (idleMs > 0) {
+      this.sweepTimer = setInterval(() => this.releaseIdle(), 30 * 1000);
+      this.sweepTimer.unref();
+    }
+  }
+
+  key(deviceId, tuner) {
+    return `${deviceId}|${tuner}`;
+  }
+
+  get(deviceId, tuner) {
+    return this.tunes.get(this.key(deviceId, tuner)) || null;
+  }
+
+  record(deviceId, tuner, clientId, { vchannel = null, source }) {
+    this.tunes.set(this.key(deviceId, tuner), {
+      deviceId,
+      tuner: String(tuner),
+      clientId,
+      vchannel,
+      source,
+      lastActionAt: Date.now()
+    });
+  }
+
+  forget(deviceId, tuner) {
+    this.tunes.delete(this.key(deviceId, tuner));
+  }
+
+  // IP or description of another client that holds or streams from the tuner, or null
+  async findHolder(deviceId, tuner) {
+    const [lockkey, target, targets] = await Promise.all([
+      this.controller.getStatusCommand(deviceId, tuner, 'lockkey'),
+      this.controller.getStatusCommand(deviceId, tuner, 'target'),
+      this.controller.getTunerTargets(deviceId)
+    ]);
+    if (lockkey && lockkey !== 'none') return lockkey;
+    if (target && target !== 'none') {
+      const match = /\/\/([^:/]+)/.exec(target);
+      return match ? match[1] : target;
+    }
+    return targets?.[String(tuner)] || null;
+  }
+
+  // Resolves { ok: true } when this client may change the tuner, otherwise { ok: false, error }
+  async checkCanTune(deviceId, tuner, clientId) {
+    const entry = this.get(deviceId, tuner);
+    if (entry && entry.clientId !== clientId) {
+      return { ok: false, error: 'Tuner is being tested from another browser' };
+    }
+    const holder = await this.findHolder(deviceId, tuner);
+    if (holder) {
+      this.forget(deviceId, tuner);
+      return { ok: false, error: `Tuner in use by ${holder}` };
+    }
+    return { ok: true };
+  }
+
+  // Free a controlled tuner, unless another client took it in the meantime
+  async release(deviceId, tuner, reason) {
+    const entry = this.get(deviceId, tuner);
+    if (!entry) return;
+    this.forget(deviceId, tuner);
+
+    const holder = await this.findHolder(deviceId, tuner);
+    if (holder) {
+      console.log(`Test tune ${deviceId} tuner ${tuner}: not released (${reason}), now in use by ${holder}`);
+      return;
+    }
+    try {
+      await this.controller.clearTuner(deviceId, tuner);
+      console.log(`Test tune ${deviceId} tuner ${tuner}: released (${reason})`);
+    } catch (error) {
+      console.error(`Test tune ${deviceId} tuner ${tuner}: release failed (${reason}):`, error.message);
+    }
+  }
+
+  async releaseWhere(predicate, reason) {
+    const entries = Array.from(this.tunes.values()).filter(predicate);
+    await Promise.all(entries.map(entry => this.release(entry.deviceId, entry.tuner, reason)));
+  }
+
+  releaseClient(clientId, { source = null, deviceId = null } = {}, reason = 'client request') {
+    return this.releaseWhere(
+      entry => entry.clientId === clientId &&
+        (!source || entry.source === source) &&
+        (!deviceId || entry.deviceId === deviceId),
+      reason
+    );
+  }
+
+  releaseIdle() {
+    const cutoff = Date.now() - this.idleMs;
+    return this.releaseWhere(entry => entry.lastActionAt < cutoff, 'idle timeout');
+  }
+
+  releaseAll(reason) {
+    return this.releaseWhere(() => true, reason);
+  }
+
+  attachSocket(socket) {
+    const clientId = socket.handshake.auth?.clientId;
+    if (!CLIENT_ID_PATTERN.test(clientId || '')) return;
+    socket.data.clientId = clientId;
+
+    if (!this.clientSockets.has(clientId)) this.clientSockets.set(clientId, new Set());
+    this.clientSockets.get(clientId).add(socket.id);
+
+    const timer = this.disconnectTimers.get(clientId);
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectTimers.delete(clientId);
+    }
+  }
+
+  detachSocket(socket) {
+    const clientId = socket.data.clientId;
+    if (!clientId) return;
+    const sockets = this.clientSockets.get(clientId);
+    if (!sockets) return;
+    sockets.delete(socket.id);
+    if (sockets.size > 0) return;
+
+    this.clientSockets.delete(clientId);
+    const timer = setTimeout(() => {
+      this.disconnectTimers.delete(clientId);
+      this.releaseClient(clientId, {}, 'browser disconnected');
+    }, this.disconnectGraceMs);
+    timer.unref();
+    this.disconnectTimers.set(clientId, timer);
+  }
+
+  // Called each status tick. Drops the entry when another client took the tuner
+  // or the tuner was cleared, so the app never frees a tuner it no longer owns.
+  reconcile(deviceId, tuner, status, targetIp) {
+    const entry = this.get(deviceId, tuner);
+    if (!entry) return;
+    if (targetIp || status?.channel === 'none') this.forget(deviceId, tuner);
+  }
+
+  // State of one tuner as seen by one browser
+  stateFor(deviceId, tuner, targetIp, clientId) {
+    if (targetIp) return { state: 'in-use', owner: targetIp };
+    const entry = this.get(deviceId, tuner);
+    if (!entry) return { state: 'free' };
+    if (entry.clientId !== clientId) return { state: 'in-use', owner: 'another browser' };
+    return {
+      state: 'controlled',
+      vchannel: entry.vchannel,
+      source: entry.source,
+      releaseInMs: this.idleMs > 0 ? Math.max(0, entry.lastActionAt + this.idleMs - Date.now()) : null
+    };
+  }
+
+  // States for all tuners of a device, keyed by tuner index
+  statesFor(deviceId, tunerIndexes, targets, statuses, clientId) {
+    const states = {};
+    tunerIndexes.forEach(tuner => {
+      const targetIp = targets?.[String(tuner)] || null;
+      if (statuses && tuner in statuses) this.reconcile(deviceId, tuner, statuses[tuner], targetIp);
+      states[tuner] = this.stateFor(deviceId, tuner, targetIp, clientId);
+    });
+    return states;
+  }
+}
+
 const hdhrController = new HDHomeRunController();
+const testTunes = new TestTuneManager(hdhrController, {
+  idleMs: parseIdleMinutes(process.env.TEST_TUNE_IDLE_MINUTES ?? 15) * 60 * 1000,
+  disconnectGraceMs: 2 * 60 * 1000
+});
 
 // API Routes
 app.get('/api/devices', async (req, res) => {
@@ -1108,6 +1337,14 @@ ${streamUrl}
 // Socket.IO for real-time updates
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
+  testTunes.attachSocket(socket);
+
+  // Free the tuners this browser tuned, for example when it leaves Antenna Mode
+  socket.on('release-test-tunes', ({ deviceId, source } = {}) => {
+    const clientId = socket.data.clientId;
+    if (!clientId) return;
+    testTunes.releaseClient(clientId, { deviceId, source }, source ? `left ${source}` : 'client request');
+  });
 
   socket.on('start-monitoring', ({ deviceId, tuner }) => {
     console.log(`Starting monitoring for device ${deviceId}, tuner ${tuner}`);
@@ -1127,8 +1364,23 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
     hdhrController.stopMonitoring(socket);
+    testTunes.detachSocket(socket);
   });
 });
+
+// Free test tunes on a normal container stop. Docker sends SIGTERM to PID 1.
+let shuttingDown = false;
+const shutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received, releasing test tunes`);
+  const forceExit = setTimeout(() => process.exit(0), 5000);
+  await testTunes.releaseAll('server shutdown');
+  clearTimeout(forceExit);
+  process.exit(0);
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Version endpoint for update checking
 app.get('/api/version', (req, res) => {
