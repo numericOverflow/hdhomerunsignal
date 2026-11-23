@@ -721,6 +721,18 @@ class HDHomeRunController {
     });
   }
 
+  async setVchannel(deviceId, tuner, vchannel) {
+    return new Promise((resolve, reject) => {
+      exec(`hdhomerun_config ${deviceId} set /tuner${tuner}/vchannel ${vchannel}`, (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(stdout.trim());
+      });
+    });
+  }
+
   async setAtsc3Channel(deviceId, tuner, channel, plps = []) {
     return new Promise((resolve, reject) => {
       let channelStr = `atsc3:${channel}`;
@@ -1200,11 +1212,64 @@ app.get('/api/devices/:id/tuner/:tuner/programs', async (req, res) => {
   }
 });
 
+// RF channel values such as 31, auto:31 or atsc3:27:0+1. Strict, because the value goes into a shell command.
+const CHANNEL_PATTERN = /^[A-Za-z0-9:+.-]{1,40}$/;
+
+// Shared check for routes that change a tuner. Refuses a tuner that another
+// client holds or that another browser is testing. Resolves the caller's client
+// ID (or null for an old frontend), or sends an error response and resolves undefined.
+async function guardTunerChange(req, res) {
+  const { id, tuner } = req.params;
+  if (!TUNER_PATTERN.test(tuner)) {
+    res.status(400).json({ error: 'Invalid tuner' });
+    return undefined;
+  }
+  const clientId = CLIENT_ID_PATTERN.test(req.body?.clientId || '') ? req.body.clientId : null;
+  const check = await testTunes.checkCanTune(id, tuner, clientId);
+  if (!check.ok) {
+    res.status(409).json({ error: check.error });
+    return undefined;
+  }
+  return clientId;
+}
+
+function testTuneSource(req) {
+  return req.body?.source === 'antenna' ? 'antenna' : 'single';
+}
+
+// Tune by virtual channel, for example 11.1. The device maps it to the RF channel and program.
+app.post('/api/devices/:id/tuner/:tuner/vchannel', async (req, res) => {
+  try {
+    const { id, tuner } = req.params;
+    const vchannel = String(req.body?.vchannel || '');
+    if (!VCHANNEL_PATTERN.test(vchannel)) {
+      res.status(400).json({ error: 'Invalid virtual channel' });
+      return;
+    }
+    const clientId = await guardTunerChange(req, res);
+    if (clientId === undefined) return;
+
+    const result = await hdhrController.setVchannel(id, tuner, vchannel);
+    if (clientId) testTunes.record(id, tuner, clientId, { vchannel, source: testTuneSource(req) });
+    res.json({ success: true, result });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/devices/:id/tuner/:tuner/channel', async (req, res) => {
   try {
     const { id, tuner } = req.params;
-    const { channel } = req.body;
+    const channel = String(req.body?.channel || '');
+    if (!CHANNEL_PATTERN.test(channel)) {
+      res.status(400).json({ error: 'Invalid channel' });
+      return;
+    }
+    const clientId = await guardTunerChange(req, res);
+    if (clientId === undefined) return;
+
     const result = await hdhrController.setChannel(id, tuner, channel);
+    if (clientId) testTunes.record(id, tuner, clientId, { source: testTuneSource(req) });
     res.json({ success: true, result });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1234,7 +1299,11 @@ app.post('/api/devices/:id/tuner/:tuner/channel/down', async (req, res) => {
 app.post('/api/devices/:id/tuner/:tuner/clear', async (req, res) => {
   try {
     const { id, tuner } = req.params;
+    const clientId = await guardTunerChange(req, res);
+    if (clientId === undefined) return;
+
     const result = await hdhrController.clearTuner(id, tuner);
+    testTunes.forget(id, tuner);
     res.json({ success: true, result });
   } catch (error) {
     res.status(500).json({ error: error.message });
